@@ -1375,7 +1375,6 @@ export async function buildAppStaticPaths({
         incrementalCache,
         supportsDynamicHTML: true,
         isRevalidate: false,
-        isBot: false,
         // building static paths should never postpone
         experimental: { ppr: false },
       },
