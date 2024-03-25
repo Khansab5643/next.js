@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use indexmap::IndexSet;
 use next_core::{
     all_assets_from_entries,
+    app_segment_config::NextSegmentConfig,
     app_structure::{
         get_entrypoints, Entrypoint as AppEntrypoint, Entrypoints as AppEntrypoints, LoaderTree,
         MetadataItem,
@@ -522,11 +523,18 @@ pub fn app_entry_point_to_route(
                 })
                 .collect(),
         ),
-        AppEntrypoint::AppRoute { page, path } => Route::AppRoute {
+        AppEntrypoint::AppRoute {
+            page,
+            path,
+            root_segment_config,
+        } => Route::AppRoute {
             original_name: page.to_string(),
             endpoint: Vc::upcast(
                 AppEndpoint {
-                    ty: AppEndpointType::Route { path },
+                    ty: AppEndpointType::Route {
+                        path,
+                        root_segment_config,
+                    },
                     app_project,
                     page,
                 }
@@ -562,6 +570,7 @@ enum AppEndpointType {
     },
     Route {
         path: Vc<FileSystemPath>,
+        root_segment_config: Vc<NextSegmentConfig>,
     },
     Metadata {
         metadata: MetadataItem,
@@ -590,14 +599,18 @@ impl AppEndpoint {
     }
 
     #[turbo_tasks::function]
-    fn app_route_entry(&self, path: Vc<FileSystemPath>) -> Vc<AppEntry> {
+    fn app_route_entry(
+        &self,
+        path: Vc<FileSystemPath>,
+        root_segment_config: Vc<NextSegmentConfig>,
+    ) -> Vc<AppEntry> {
         get_app_route_entry(
             self.app_project.route_module_context(),
             self.app_project.edge_route_module_context(),
             Vc::upcast(FileSource::new(path)),
             self.page.clone(),
             self.app_project.project().project_path(),
-            None,
+            Some(root_segment_config),
         )
     }
 
@@ -631,7 +644,14 @@ impl AppEndpoint {
             // NOTE(alexkirsz) For routes, technically, a lot of the following code is not needed,
             // as we know we won't have any client references. However, for now, for simplicity's
             // sake, we just do the same thing as for pages.
-            AppEndpointType::Route { path } => (self.app_route_entry(path), false, false),
+            AppEndpointType::Route {
+                path,
+                root_segment_config,
+            } => (
+                self.app_route_entry(path, root_segment_config),
+                false,
+                false,
+            ),
             AppEndpointType::Metadata { metadata } => {
                 (self.app_metadata_entry(metadata), false, false)
             }

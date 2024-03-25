@@ -9,17 +9,19 @@ use indexmap::{
 use serde::{Deserialize, Serialize};
 use tracing::Instrument;
 use turbo_tasks::{
-    debug::ValueDebugFormat, trace::TraceRawVcs, Completion, Completions, TaskInput, ValueToString,
-    Vc,
+    debug::ValueDebugFormat, trace::TraceRawVcs, Completion, Completions, TaskInput, ValueDefault,
+    ValueToString, Vc,
 };
 use turbopack_binding::{
     turbo::tasks_fs::{DirectoryContent, DirectoryEntry, FileSystemEntryType, FileSystemPath},
-    turbopack::core::issue::{
-        Issue, IssueExt, IssueSeverity, IssueStage, OptionStyledString, StyledString,
+    turbopack::core::{
+        file_source::FileSource,
+        issue::{Issue, IssueExt, IssueSeverity, IssueStage, OptionStyledString, StyledString},
     },
 };
 
 use crate::{
+    app_segment_config::NextSegmentConfig,
     next_app::{
         metadata::{
             match_global_metadata_file, match_local_metadata_file, normalize_metadata_route,
@@ -29,6 +31,7 @@ use crate::{
     },
     next_config::NextConfig,
     next_import_map::get_next_package,
+    parse_segment_config_from_source,
 };
 
 /// A final route in the app directory.
@@ -472,6 +475,7 @@ pub enum Entrypoint {
     AppRoute {
         page: AppPage,
         path: Vc<FileSystemPath>,
+        root_segment_config: Vc<NextSegmentConfig>,
     },
     AppMetadata {
         page: AppPage,
@@ -602,11 +606,16 @@ fn add_app_route(
     result: &mut IndexMap<AppPath, Entrypoint>,
     page: AppPage,
     path: Vc<FileSystemPath>,
+    root_segment_config: Vc<NextSegmentConfig>,
 ) {
     let e = match result.entry(page.clone().into()) {
         Entry::Occupied(e) => e,
         Entry::Vacant(e) => {
-            e.insert(Entrypoint::AppRoute { page, path });
+            e.insert(Entrypoint::AppRoute {
+                page,
+                path,
+                root_segment_config,
+            });
             return;
         }
     };
@@ -682,6 +691,7 @@ pub fn get_entrypoints(
         app_dir,
         get_directory_tree(app_dir, page_extensions),
         get_global_metadata(app_dir, page_extensions),
+        NextSegmentConfig::value_default(),
     )
 }
 
@@ -690,6 +700,7 @@ fn directory_tree_to_entrypoints(
     app_dir: Vc<FileSystemPath>,
     directory_tree: Vc<DirectoryTree>,
     global_metadata: Vc<GlobalMetadata>,
+    root_segment_config: Vc<NextSegmentConfig>,
 ) -> Vc<Entrypoints> {
     directory_tree_to_entrypoints_internal(
         app_dir,
@@ -697,6 +708,7 @@ fn directory_tree_to_entrypoints(
         "".to_string(),
         directory_tree,
         AppPage::new(),
+        root_segment_config,
     )
 }
 
@@ -710,6 +722,7 @@ async fn directory_tree_to_loader_tree(
     app_page: AppPage,
     // the page this loader tree is constructed for
     for_app_path: AppPath,
+    root_segment_config: Vc<NextSegmentConfig>,
 ) -> Result<Vc<Option<Vc<LoaderTree>>>> {
     let app_path = AppPath::from(app_page.clone());
 
@@ -814,6 +827,7 @@ async fn directory_tree_to_loader_tree(
             *subdirectory,
             child_app_page.clone(),
             for_app_path.clone(),
+            root_segment_config,
         )
         .await?;
 
@@ -932,6 +946,7 @@ async fn directory_tree_to_entrypoints_internal(
     directory_name: String,
     directory_tree: Vc<DirectoryTree>,
     app_page: AppPage,
+    root_segment_config: Vc<NextSegmentConfig>,
 ) -> Result<Vc<Entrypoints>> {
     let span = tracing::info_span!("build layout trees", name = display(&app_page));
     directory_tree_to_entrypoints_internal_untraced(
@@ -940,6 +955,7 @@ async fn directory_tree_to_entrypoints_internal(
         directory_name,
         directory_tree,
         app_page,
+        root_segment_config,
     )
     .instrument(span)
     .await
@@ -951,6 +967,7 @@ async fn directory_tree_to_entrypoints_internal_untraced(
     directory_name: String,
     directory_tree: Vc<DirectoryTree>,
     app_page: AppPage,
+    root_segment_config: Vc<NextSegmentConfig>,
 ) -> Result<Vc<Entrypoints>> {
     let mut result = IndexMap::new();
 
@@ -960,7 +977,20 @@ async fn directory_tree_to_entrypoints_internal_untraced(
     let subdirectories = &directory_tree.subdirectories;
     let components = directory_tree.components.await?.clone_value();
 
-    // if let Some(_) = components.page.or(components.default) {
+    // Route can have its own segment config, also can inherit from the layout root
+    // segment config. https://nextjs.org/docs/app/building-your-application/rendering/edge-and-nodejs-runtimes#segment-runtime-option
+    // if current tree have a layout segment config, treat it as _root_ segment
+    // config for the current route.
+    let root_segment_config = if let Some(layout) = components.layout {
+        let mut config = (*root_segment_config.await?).clone();
+        let source = Vc::upcast(FileSource::new(layout));
+        let layout_config = parse_segment_config_from_source(source);
+        config.apply_parent_config(&*layout_config.await?);
+        config.cell()
+    } else {
+        root_segment_config
+    };
+
     if components.page.is_some() {
         let app_path = AppPath::from(app_page.clone());
 
@@ -971,6 +1001,7 @@ async fn directory_tree_to_entrypoints_internal_untraced(
             directory_tree_vc,
             app_page.clone(),
             app_path,
+            root_segment_config,
         )
         .await?;
 
@@ -989,6 +1020,7 @@ async fn directory_tree_to_entrypoints_internal_untraced(
             &mut result,
             app_page.complete(PageType::Route)?,
             route,
+            root_segment_config,
         );
     }
 
@@ -1093,6 +1125,7 @@ async fn directory_tree_to_entrypoints_internal_untraced(
             subdir_name.to_string(),
             subdirectory,
             child_app_page.clone(),
+            root_segment_config,
         )
         .await?;
 
@@ -1118,6 +1151,7 @@ async fn directory_tree_to_entrypoints_internal_untraced(
                             directory_tree_vc,
                             app_page.clone(),
                             app_path,
+                            root_segment_config,
                         )
                         .await?;
 
@@ -1131,8 +1165,18 @@ async fn directory_tree_to_entrypoints_internal_untraced(
                         .await?;
                     }
                 }
-                Entrypoint::AppRoute { ref page, path } => {
-                    add_app_route(app_dir, &mut result, page.clone(), path);
+                Entrypoint::AppRoute {
+                    ref page,
+                    path,
+                    root_segment_config,
+                } => {
+                    add_app_route(
+                        app_dir,
+                        &mut result,
+                        page.clone(),
+                        path,
+                        root_segment_config,
+                    );
                 }
                 Entrypoint::AppMetadata { ref page, metadata } => {
                     add_app_metadata_route(app_dir, &mut result, page.clone(), metadata);
